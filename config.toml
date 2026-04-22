@@ -1,0 +1,36 @@
+[paths]
+data_root = "/rhf/dk77/data/raw"
+ckpt_dir = "checkpoints"
+
+[pretrain]
+epochs = 200
+warmup_epochs = 10
+# Per-GPU batch of pairs; backbone sees 2× this (concat views). ~11GB: 256 is safer than 512.
+batch_size = 256
+lr = 0.3
+temperature = 0.5
+# Mixed precision cuts VRAM and often speeds training on modern GPUs.
+use_amp = true
+save_every = 10
+workers = 8
+# Higher prefetch keeps the GPU fed when augmentations are CPU-heavy (SimCLR runs each aug twice).
+prefetch_factor = 4
+# tqdm/loss sync every N steps (each sync idles the GPU briefly).
+pbar_refresh_every = 20
+log_aug_every = 0
+
+[finetune]
+# After pretraining.py, set e.g. backbone_ckpt = "checkpoints/simclr_final.pth" (path relative to repo root unless absolute).
+backbone_ckpt = "checkpoints/simclr_final.pth"
+probe_epochs = 10
+epochs = 200
+batch_size = 128
+backbone_lr = 0.0001
+head_lr = 0.001
+val_split = 0.2
+patience = 15
+workers = 6
+
+[etl]
+competition = "elec-378-sp-26-final-project"
+output_dir = "etl/raw"
