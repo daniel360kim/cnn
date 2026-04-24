@@ -16,7 +16,7 @@ from tqdm.auto import tqdm
 
 import cfg
 from dataset import build_simclr_dataset
-from models import ResNet18, SimCLRModel
+from models import SimCLRModel, build_backbone
 
 
 def nt_xent(z1, z2, t):
@@ -49,9 +49,7 @@ def unwrap(m):
 
 
 def _worker_init(_):
-    # Avoid worker processes each spawning many BLAS threads (CPU oversubscription → slow dataloader).
     import torch as _t
-
     _t.set_num_threads(1)
 
 
@@ -71,10 +69,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
-        # benchmark + DataParallel threads -> CUDNN_STATUS_NOT_INITIALIZED on some setups
         torch.backends.cudnn.benchmark = torch.cuda.device_count() == 1
         print("device", device, torch.cuda.get_device_name(0))
-        # Ampere (SM80+) and newer: TF32 speeds convs and the NT-Xent matmul with negligible impact here.
         major, _ = torch.cuda.get_device_capability(0)
         if major >= 8:
             torch.set_float32_matmul_precision("high")
@@ -84,8 +80,9 @@ def main():
     else:
         print("device", device, "(no cuda — check driver and CUDA_VISIBLE_DEVICES)")
 
+    img_size = int(p.get("img_size", 224))
     log_aug = int(p.get("log_aug_every", 0))
-    ds = build_simclr_dataset(data_root=data_root, aug_log_every=log_aug)
+    ds = build_simclr_dataset(data_root=data_root, size=img_size, aug_log_every=log_aug)
     w = int(p["workers"])
     kw = dict(
         batch_size=int(p["batch_size"]),
@@ -99,9 +96,15 @@ def main():
         kw["prefetch_factor"] = max(2, int(p.get("prefetch_factor", 4)))
         kw["worker_init_fn"] = _worker_init
     loader = DataLoader(ds, **kw)
-    print(len(ds), "images", len(loader), "batches/epoch")
+    print(len(ds), "images", len(loader), "batches/epoch", "size", img_size)
 
-    m = SimCLRModel(ResNet18())
+    backbone_name = p.get("backbone", "resnet18")
+    backbone = build_backbone(backbone_name)
+    proj_hidden = int(p.get("proj_hidden", 512))
+    proj_out = int(p.get("proj_out", 128))
+    m = SimCLRModel(backbone, proj_hidden=proj_hidden, proj_out=proj_out)
+    print("backbone {} embed_dim {} proj_hidden {} proj_out {}".format(
+        backbone_name, backbone.embed_dim, proj_hidden, proj_out))
     if torch.cuda.device_count() > 1:
         m = nn.DataParallel(m)
     m = m.to(device)
@@ -115,6 +118,7 @@ def main():
             print("torch.compile enabled (single-GPU)")
         except Exception as ex:
             print("torch.compile skipped:", ex)
+
     opt = torch.optim.SGD(m.parameters(), lr=float(p["lr"]), momentum=0.9, weight_decay=1e-4)
     use_amp = device.type == "cuda" and bool(p.get("use_amp", True))
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if device.type == "cuda" else None
@@ -126,7 +130,6 @@ def main():
     warm = int(p["warmup_epochs"]) * len(loader)
     step = 0
     first_step = True
-    # Avoid loss.item() / tqdm postfix every step — GPU sync stalls overlap with the next batch.
     pbar_refresh = max(1, int(p.get("pbar_refresh_every", 20)))
 
     with tqdm(
@@ -135,7 +138,6 @@ def main():
         dynamic_ncols=True,
         mininterval=0.5,
         miniters=max(10, total // 200),
-        # Default smoothing keeps the first (slow) step in the ETA for a long time.
         smoothing=0.45,
     ) as pbar:
         for ep in range(1, epochs + 1):

@@ -1,6 +1,6 @@
 [paths]
 data_root = "/rhf/dk77/data/raw"
-ckpt_dir = "checkpoints"
+ckpt_dir = "checkpoints/pretrain_ft"
 
 [pretrain]
 backbone = "resnet50"
@@ -21,7 +21,7 @@ log_aug_every = 0
 
 [finetune]
 backbone = "resnet50"
-backbone_ckpt = ""
+backbone_ckpt = "checkpoints/simclr_final.pth"
 img_size = 256
 dropout = 0.3
 probe_epochs = 10

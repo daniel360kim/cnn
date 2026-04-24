@@ -8,6 +8,10 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 
+_MEAN = [0.485, 0.456, 0.406]
+_STD = [0.229, 0.224, 0.225]
+
+
 def build_label_encoder(csv_path):
     df = pd.read_csv(csv_path)
     idx2cls = sorted(df["TARGET"].unique())
@@ -15,46 +19,60 @@ def build_label_encoder(csv_path):
     return cls2idx, idx2cls
 
 
-def get_simclr_transform(size=224):
+def get_simclr_transform(size=224, strong_blur=True):
+    """One view for SimCLR. Call twice with strong_blur=True/False for asymmetric views."""
     k = int(0.1 * size) | 1
-    return transforms.Compose(
-        [
-            transforms.RandomResizedCrop(size, scale=(0.2, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([transforms.GaussianBlur(k)], p=0.5),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ]
-    )
+    blur_p = 0.5 if strong_blur else 0.1
+    aug = [
+        transforms.RandomResizedCrop(size, scale=(0.2, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.RandomApply([transforms.GaussianBlur(k)], p=blur_p),
+    ]
+    try:
+        aug.append(transforms.RandomSolarize(threshold=128, p=0.1))
+    except AttributeError:
+        pass  # torchvision < 0.11
+    aug += [
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_MEAN, std=_STD),
+    ]
+    return transforms.Compose(aug)
 
 
 def get_supervised_transform(size=224, train=True):
     if train:
         return transforms.Compose(
             [
-                transforms.RandomResizedCrop(size),
+                transforms.RandomResizedCrop(size, scale=(0.5, 1.0)),
                 transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(0.2, 0.2, 0.2, 0.1),
+                transforms.RandomVerticalFlip(p=0.15),
+                transforms.RandomRotation(15),
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
+                transforms.RandomApply([transforms.GaussianBlur(5)], p=0.2),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                transforms.Normalize(mean=_MEAN, std=_STD),
+                transforms.RandomErasing(p=0.25, scale=(0.02, 0.15)),
             ]
         )
+    val_size = int(size * 256 / 224)
     return transforms.Compose(
         [
-            transforms.Resize(int(size * 256 / 224)),
+            transforms.Resize(val_size),
             transforms.CenterCrop(size),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=_MEAN, std=_STD),
         ]
     )
 
 
 class SimCLRDataset(Dataset):
-    def __init__(self, img_paths, transform, aug_log_every=0):
+    def __init__(self, img_paths, aug_log_every=0):
         self.img_paths = img_paths
-        self.transform = transform
+        # Asymmetric views: view 1 has strong blur, view 2 has weak blur
+        self.transform1 = get_simclr_transform(strong_blur=True)
+        self.transform2 = get_simclr_transform(strong_blur=False)
         self.aug_log_every = aug_log_every
         self._aug_n = 0
 
@@ -71,10 +89,10 @@ class SimCLRDataset(Dataset):
         img = Image.open(self.img_paths[idx]).convert("RGB")
         if log:
             t1 = time.perf_counter()
-        v1 = self.transform(img)
+        v1 = self.transform1(img)
         if log:
             t2 = time.perf_counter()
-        v2 = self.transform(img)
+        v2 = self.transform2(img)
         if log:
             t3 = time.perf_counter()
             print(
@@ -126,4 +144,8 @@ def build_simclr_dataset(data_root, size=224, aug_log_every=0):
     train_dir = Path(data_root) / "train_images" / "train_images"
     test_dir = Path(data_root) / "test_images" / "test_images"
     paths = sorted(train_dir.glob("*.jpg")) + sorted(test_dir.glob("*.jpg"))
-    return SimCLRDataset(paths, get_simclr_transform(size), aug_log_every=aug_log_every)
+    ds = SimCLRDataset(paths, aug_log_every=aug_log_every)
+    # Update transforms to use the configured size
+    ds.transform1 = get_simclr_transform(size=size, strong_blur=True)
+    ds.transform2 = get_simclr_transform(size=size, strong_blur=False)
+    return ds

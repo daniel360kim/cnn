@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 
 import cfg
 from dataset import ButterflyDataset, build_label_encoder, get_supervised_transform
-from models import Classifier, ResNet18
+from models import Classifier, build_backbone
 
 
 def load_sd(path: Path):
@@ -106,6 +106,9 @@ def main():
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = torch.cuda.device_count() == 1
 
+    backbone_name = f.get("backbone", "resnet18")
+    img_size = int(f.get("img_size", 224))
+
     cls2idx, idx2cls = build_label_encoder(data_root / "train.csv")
     df = pd.read_csv(data_root / "train.csv")
     tr, va = train_test_split(
@@ -113,10 +116,10 @@ def main():
     )
     img_dir = data_root / "train_images" / "train_images"
     tr_ds = ButterflyDataset(
-        tr.reset_index(drop=True), img_dir, get_supervised_transform(train=True), cls2idx
+        tr.reset_index(drop=True), img_dir, get_supervised_transform(img_size, train=True), cls2idx
     )
     va_ds = ButterflyDataset(
-        va.reset_index(drop=True), img_dir, get_supervised_transform(train=False), cls2idx
+        va.reset_index(drop=True), img_dir, get_supervised_transform(img_size, train=False), cls2idx
     )
     tr_ld = DataLoader(tr_ds, batch_size=bs, shuffle=True, num_workers=w, pin_memory=True)
     va_ld = DataLoader(va_ds, batch_size=bs, shuffle=False, num_workers=w, pin_memory=True)
@@ -125,7 +128,7 @@ def main():
     results: list[tuple[str, int | None, Path, float, float]] = []
 
     for label, sort_key, ckpt_path in tqdm(discovered, desc="checkpoints"):
-        backbone = ResNet18()
+        backbone = build_backbone(backbone_name)
         backbone.load_state_dict(load_sd(ckpt_path), strict=True)
         model = Classifier(backbone, num_classes=len(idx2cls))
         if torch.cuda.device_count() > 1:
