@@ -44,6 +44,24 @@ def mixup_batch(imgs, labels, alpha, device):
     return mixed, labels, labels[idx], lam
 
 
+def cutmix_batch(imgs, labels, alpha, device):
+    if alpha <= 0:
+        return imgs, labels, labels, 1.0
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    n, _, H, W = imgs.shape
+    idx = torch.randperm(n, device=device)
+    cut_w = int(W * math.sqrt(1 - lam))
+    cut_h = int(H * math.sqrt(1 - lam))
+    cx = torch.randint(W, (1,)).item()
+    cy = torch.randint(H, (1,)).item()
+    x1, x2 = max(cx - cut_w // 2, 0), min(cx + cut_w // 2, W)
+    y1, y2 = max(cy - cut_h // 2, 0), min(cy + cut_h // 2, H)
+    mixed = imgs.clone()
+    mixed[:, :, y1:y2, x1:x2] = imgs[idx, :, y1:y2, x1:x2]
+    lam = 1 - (x2 - x1) * (y2 - y1) / (W * H)
+    return mixed, labels, labels[idx], lam
+
+
 def mixup_loss(crit, logits, y_a, y_b, lam):
     return lam * crit(logits, y_a) + (1 - lam) * crit(logits, y_b)
 
@@ -57,7 +75,7 @@ def make_lr_lambda(warmup_epochs, total_epochs):
     return fn
 
 
-def run_epoch(model, loader, crit, opt, device, train, mixup_alpha=0.0, desc=None):
+def run_epoch(model, loader, crit, opt, device, train, mixup_alpha=0.0, cutmix_alpha=0.0, desc=None):
     model.train(train)
     loss_sum, correct, n = 0.0, 0, 0
     ctx = torch.enable_grad() if train else torch.no_grad()
@@ -66,8 +84,12 @@ def run_epoch(model, loader, crit, opt, device, train, mixup_alpha=0.0, desc=Non
         for imgs, labels in it:
             imgs = imgs.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
-            if train and mixup_alpha > 0:
-                imgs, y_a, y_b, lam = mixup_batch(imgs, labels, mixup_alpha, device)
+            if train and (mixup_alpha > 0 or cutmix_alpha > 0):
+                use_cutmix = cutmix_alpha > 0 and (mixup_alpha <= 0 or torch.rand(1).item() > 0.5)
+                if use_cutmix:
+                    imgs, y_a, y_b, lam = cutmix_batch(imgs, labels, cutmix_alpha, device)
+                else:
+                    imgs, y_a, y_b, lam = mixup_batch(imgs, labels, mixup_alpha, device)
                 logits = model(imgs)
                 loss = mixup_loss(crit, logits, y_a, y_b, lam)
             else:
@@ -108,7 +130,8 @@ def train_fold(f, tr, va, img_dir, cls2idx, idx2cls, device, ckpt_path, fold_lab
     img_size = int(f.get("img_size", 224))
     bs = int(f["batch_size"])
     w = int(f["workers"])
-    tr_ds = ButterflyDataset(tr.reset_index(drop=True), img_dir, get_supervised_transform(img_size, train=True), cls2idx)
+    aug_strength = f.get("aug", "default")
+    tr_ds = ButterflyDataset(tr.reset_index(drop=True), img_dir, get_supervised_transform(img_size, train=True, strength=aug_strength), cls2idx)
     va_ds = ButterflyDataset(va.reset_index(drop=True), img_dir, get_supervised_transform(img_size, train=False), cls2idx)
     tr_ld = DataLoader(tr_ds, batch_size=bs, shuffle=True, num_workers=w, pin_memory=True)
     va_ld = DataLoader(va_ds, batch_size=bs, shuffle=False, num_workers=w, pin_memory=True)
@@ -117,6 +140,7 @@ def train_fold(f, tr, va, img_dir, cls2idx, idx2cls, device, ckpt_path, fold_lab
     model = build_model(f, len(idx2cls), device)
     crit = nn.CrossEntropyLoss(label_smoothing=float(f.get("label_smoothing", 0.0)))
     mixup_alpha = float(f.get("mixup_alpha", 0.0))
+    cutmix_alpha = float(f.get("cutmix_alpha", 0.0))
 
     probe_epochs = int(f.get("probe_epochs", 0))
     ckpt = (f.get("backbone_ckpt") or "").strip()
@@ -156,7 +180,7 @@ def train_fold(f, tr, va, img_dir, cls2idx, idx2cls, device, ckpt_path, fold_lab
     best, bad = 0.0, 0
     for ep in range(1, epochs + 1):
         tr_loss, tr_acc = run_epoch(
-            model, tr_ld, crit, opt_b, device, True, mixup_alpha,
+            model, tr_ld, crit, opt_b, device, True, mixup_alpha, cutmix_alpha,
             desc="train {}/{}".format(ep, epochs),
         )
         va_loss, va_acc = run_epoch(
@@ -182,6 +206,65 @@ def train_fold(f, tr, va, img_dir, cls2idx, idx2cls, device, ckpt_path, fold_lab
 
     print("{} best val {}".format(fold_label, round(best, 4)))
     return best
+
+
+def train_full(f, df, img_dir, cls2idx, idx2cls, device, ckpt_path):
+    """Train on the entire dataset for a fixed number of epochs (no early stopping)."""
+    img_size = int(f.get("img_size", 224))
+    bs = int(f["batch_size"])
+    w = int(f["workers"])
+    aug_strength = f.get("aug", "default")
+    ds = ButterflyDataset(df.reset_index(drop=True), img_dir, get_supervised_transform(img_size, train=True, strength=aug_strength), cls2idx)
+    loader = DataLoader(ds, batch_size=bs, shuffle=True, num_workers=w, pin_memory=True)
+    print("full train {} samples".format(len(ds)))
+
+    model = build_model(f, len(idx2cls), device)
+    crit = nn.CrossEntropyLoss(label_smoothing=float(f.get("label_smoothing", 0.0)))
+    mixup_alpha = float(f.get("mixup_alpha", 0.0))
+    cutmix_alpha = float(f.get("cutmix_alpha", 0.0))
+
+    probe_epochs = int(f.get("probe_epochs", 0))
+    ckpt = (f.get("backbone_ckpt") or "").strip()
+    if ckpt and probe_epochs > 0:
+        print("linear probe", probe_epochs, "epochs")
+        for p in unwrap(model).backbone.parameters():
+            p.requires_grad_(False)
+        opt_a = torch.optim.SGD(
+            [p for p in model.parameters() if p.requires_grad], lr=0.1, momentum=0.9
+        )
+        sch_a = torch.optim.lr_scheduler.CosineAnnealingLR(opt_a, T_max=probe_epochs)
+        for ep in range(1, probe_epochs + 1):
+            _, tr_acc = run_epoch(model, loader, crit, opt_a, device, True,
+                                  desc="probe {}/{}".format(ep, probe_epochs))
+            sch_a.step()
+            print("probe", ep, "/", probe_epochs, "train acc", round(tr_acc, 4))
+        for p in unwrap(model).backbone.parameters():
+            p.requires_grad_(True)
+
+    epochs = int(f.get("full_train_epochs", f["epochs"]))
+    warmup_epochs = int(f.get("warmup_epochs", 0))
+    wd = float(f.get("weight_decay", 1e-4))
+    opt_b = torch.optim.AdamW(
+        [
+            {"params": unwrap(model).backbone.parameters(), "lr": float(f["backbone_lr"])},
+            {"params": unwrap(model).fc.parameters(), "lr": float(f["head_lr"])},
+        ],
+        weight_decay=wd,
+    )
+    sch_b = torch.optim.lr_scheduler.LambdaLR(opt_b, make_lr_lambda(warmup_epochs, epochs))
+
+    print("full train {} epochs, warmup {}".format(epochs, warmup_epochs))
+    for ep in range(1, epochs + 1):
+        tr_loss, tr_acc = run_epoch(
+            model, loader, crit, opt_b, device, True, mixup_alpha, cutmix_alpha,
+            desc="train {}/{}".format(ep, epochs),
+        )
+        sch_b.step()
+        lr0 = opt_b.param_groups[0]["lr"]
+        print("epoch", ep, "train", round(tr_acc, 4), round(tr_loss, 4), "lr", round(lr0, 6))
+
+    torch.save(unwrap(model).state_dict(), ckpt_path)
+    print("saved ->", ckpt_path)
 
 
 def main():
@@ -233,6 +316,8 @@ def main():
         best_dst = ckpt_dir / "classifier_best.pth"
         shutil.copy2(best_src, best_dst)
         print("best fold {} ({}) -> {}".format(best_fold, round(fold_accs[best_fold], 4), best_dst))
+    elif float(f.get("val_split", 0.1)) == 0.0:
+        train_full(f, df, img_dir, cls2idx, idx2cls, device, ckpt_dir / "classifier_best.pth")
     else:
         tr, va = train_test_split(
             df, test_size=float(f["val_split"]), stratify=df["TARGET"], random_state=42

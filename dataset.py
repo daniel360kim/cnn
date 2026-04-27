@@ -41,8 +41,19 @@ def get_simclr_transform(size=224, strong_blur=True):
     return transforms.Compose(aug)
 
 
-def get_supervised_transform(size=224, train=True):
+def get_supervised_transform(size=224, train=True, strength="default"):
     if train:
+        if strength == "strong":
+            return transforms.Compose(
+                [
+                    transforms.RandomResizedCrop(size, scale=(0.2, 1.0)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandAugment(num_ops=2, magnitude=9),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=_MEAN, std=_STD),
+                    transforms.RandomErasing(p=0.4, scale=(0.02, 0.25)),
+                ]
+            )
         return transforms.Compose(
             [
                 transforms.RandomResizedCrop(size, scale=(0.5, 1.0)),
